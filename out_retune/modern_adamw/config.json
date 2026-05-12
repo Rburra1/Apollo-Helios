@@ -1,0 +1,33 @@
+{
+  "preset": "modern",
+  "preset_flags": {
+    "use_rope": true,
+    "norm_type": "rmsnorm",
+    "use_qk_norm": true,
+    "ffn_type": "swiglu"
+  },
+  "optimizer": "adamw",
+  "hparams": {
+    "preset": "modern",
+    "optimizer": "adamw",
+    "data_dir": "data",
+    "out_dir": "out_retune",
+    "vocab_size": 32000,
+    "block_size": 256,
+    "batch_size": 24,
+    "iters": 8000,
+    "hours": 8.0,
+    "lr": 0.00012,
+    "muon_lr": 0.02,
+    "dropout": 0.1,
+    "eval_interval": 250,
+    "eval_iters": 25,
+    "log_interval": 25,
+    "save_interval": 1000,
+    "patience": 12,
+    "weight_decay": 0.1,
+    "grad_clip": 1.0
+  },
+  "param_count_body": 24913408,
+  "param_count_total": 41297408
+}

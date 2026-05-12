@@ -1,0 +1,33 @@
+{
+  "preset": "qknorm",
+  "preset_flags": {
+    "use_rope": false,
+    "norm_type": "layernorm",
+    "use_qk_norm": true,
+    "ffn_type": "gelu"
+  },
+  "optimizer": "adamw",
+  "hparams": {
+    "preset": "qknorm",
+    "optimizer": "adamw",
+    "data_dir": "data",
+    "out_dir": "out",
+    "vocab_size": 32000,
+    "block_size": 256,
+    "batch_size": 24,
+    "iters": 8000,
+    "hours": 8.0,
+    "lr": 0.00025,
+    "muon_lr": 0.02,
+    "dropout": 0.1,
+    "eval_interval": 250,
+    "eval_iters": 25,
+    "log_interval": 25,
+    "save_interval": 1000,
+    "patience": 8,
+    "weight_decay": 0.1,
+    "grad_clip": 1.0
+  },
+  "param_count_body": 25184256,
+  "param_count_total": 41699328
+}

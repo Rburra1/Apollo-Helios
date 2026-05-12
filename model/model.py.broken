@@ -1,0 +1,367 @@
+"""
+Apollo-Modern transformer.
+
+Same body params as Apollo v2 (~25.3M, 8L/8H/512) for direct comparability.
+Each modern component is gated by a config flag so a single model file
+runs all ablations.
+
+Toggleable components:
+    use_rope        : RoPE vs learned absolute position embeddings
+    norm_type       : 'rmsnorm' vs 'layernorm'
+    use_qk_norm     : RMSNorm on Q and K post-projection
+    ffn_type        : 'swiglu' vs 'gelu'
+
+Optimizer choice (muon vs adamw) is handled in train.py, not here.
+"""
+
+import math
+from dataclasses import dataclass, field
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ----------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------
+
+@dataclass
+class ApolloModernConfig:
+    # Architecture (held constant across ablations to match Apollo v2 body)
+    n_layer: int = 8
+    n_head: int = 8
+    n_embd: int = 512
+    block_size: int = 256
+    vocab_size: int = 32000
+    dropout: float = 0.0
+    bias: bool = False  # Modern recipe: no biases on Linear/Norm
+
+    # Ablation knobs
+    use_rope: bool = True
+    norm_type: str = 'rmsnorm'    # 'rmsnorm' or 'layernorm'
+    use_qk_norm: bool = True
+    ffn_type: str = 'swiglu'       # 'swiglu' or 'gelu'
+
+    # SwiGLU hidden dim. (2/3 * 4 * n_embd) rounded to multiple of 64.
+    # At n_embd=512 this gives 1344 -> 3*512*1344 = 2.06M params per FFN.
+    # GELU 4x baseline: 2*512*2048 = 2.10M params per FFN.
+    # Within ~2% of each other. Document any param drift in ABLATIONS.md.
+    swiglu_hidden: int = 1344
+    gelu_hidden: int = 2048
+
+    # Init
+    init_std: float = 0.02
+
+
+# ----------------------------------------------------------------------
+# Norms
+# ----------------------------------------------------------------------
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return x * rms * self.weight
+
+
+def make_norm(dim: int, norm_type: str) -> nn.Module:
+    if norm_type == 'rmsnorm':
+        return RMSNorm(dim)
+    elif norm_type == 'layernorm':
+        return nn.LayerNorm(dim, bias=False)
+    raise ValueError(f"unknown norm_type: {norm_type}")
+
+
+# ----------------------------------------------------------------------
+# RoPE
+# ----------------------------------------------------------------------
+
+def build_rope_cache(seq_len: int, head_dim: int, device, base: float = 10000.0):
+    """Precompute cos/sin tables for RoPE. head_dim must be even."""
+    assert head_dim % 2 == 0
+    theta = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    pos = torch.arange(seq_len, device=device).float()
+    freqs = torch.outer(pos, theta)               # (T, head_dim/2)
+    cos = freqs.cos()                             # (T, head_dim/2)
+    sin = freqs.sin()
+    return cos, sin
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """
+    x: (B, n_head, T, head_dim)
+    cos/sin: (T, head_dim/2)
+    """
+    # Split last dim into pairs (x_even, x_odd)
+    x1 = x[..., 0::2]    # (B, h, T, head_dim/2)
+    x2 = x[..., 1::2]
+    # Broadcast cos/sin: (1, 1, T, head_dim/2)
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
+    # Rotation: (x1, x2) -> (x1*cos - x2*sin, x1*sin + x2*cos)
+    rot1 = x1 * cos - x2 * sin
+    rot2 = x1 * sin + x2 * cos
+    # Interleave back
+    out = torch.empty_like(x)
+    out[..., 0::2] = rot1
+    out[..., 1::2] = rot2
+    return out
+
+
+# ----------------------------------------------------------------------
+# Attention
+# ----------------------------------------------------------------------
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg: ApolloModernConfig):
+        super().__init__()
+        assert cfg.n_embd % cfg.n_head == 0
+        self.n_head = cfg.n_head
+        self.head_dim = cfg.n_embd // cfg.n_head
+        self.use_rope = cfg.use_rope
+        self.use_qk_norm = cfg.use_qk_norm
+
+        # Single fused QKV projection (same as Apollo v2)
+        self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
+        self.proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
+
+        if cfg.use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
+
+        self.dropout = cfg.dropout
+
+    def forward(self, x: torch.Tensor, rope_cache=None) -> torch.Tensor:
+        B, T, C = x.shape
+        qkv = self.qkv(x)                                      # (B, T, 3C)
+        q, k, v = qkv.chunk(3, dim=-1)
+        # Reshape to (B, n_head, T, head_dim)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        if self.use_rope and rope_cache is not None:
+            cos, sin = rope_cache
+            q = apply_rope(q, cos[:T], sin[:T])
+            k = apply_rope(k, cos[:T], sin[:T])
+
+        # Scaled dot-product attention with causal mask.
+        # PyTorch's SDPA handles causal masking and is MPS-friendly.
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=True,
+        )
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.proj(y)
+
+
+# ----------------------------------------------------------------------
+# FFN
+# ----------------------------------------------------------------------
+
+class GELU_FFN(nn.Module):
+    def __init__(self, cfg: ApolloModernConfig):
+        super().__init__()
+        self.fc1 = nn.Linear(cfg.n_embd, cfg.gelu_hidden, bias=cfg.bias)
+        self.fc2 = nn.Linear(cfg.gelu_hidden, cfg.n_embd, bias=cfg.bias)
+
+    def forward(self, x):
+        return self.fc2(F.gelu(self.fc1(x)))
+
+
+class SwiGLU_FFN(nn.Module):
+    def __init__(self, cfg: ApolloModernConfig):
+        super().__init__()
+        h = cfg.swiglu_hidden
+        self.w1 = nn.Linear(cfg.n_embd, h, bias=cfg.bias)
+        self.w2 = nn.Linear(cfg.n_embd, h, bias=cfg.bias)
+        self.w3 = nn.Linear(h, cfg.n_embd, bias=cfg.bias)
+
+    def forward(self, x):
+        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+
+
+def make_ffn(cfg: ApolloModernConfig) -> nn.Module:
+    if cfg.ffn_type == 'swiglu':
+        return SwiGLU_FFN(cfg)
+    elif cfg.ffn_type == 'gelu':
+        return GELU_FFN(cfg)
+    raise ValueError(f"unknown ffn_type: {cfg.ffn_type}")
+
+
+# ----------------------------------------------------------------------
+# Block
+# ----------------------------------------------------------------------
+
+class Block(nn.Module):
+    def __init__(self, cfg: ApolloModernConfig):
+        super().__init__()
+        self.norm1 = make_norm(cfg.n_embd, cfg.norm_type)
+        self.attn = CausalSelfAttention(cfg)
+        self.norm2 = make_norm(cfg.n_embd, cfg.norm_type)
+        self.ffn = make_ffn(cfg)
+
+    def forward(self, x, rope_cache=None):
+        x = x + self.attn(self.norm1(x), rope_cache=rope_cache)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+# ----------------------------------------------------------------------
+# Top-level model
+# ----------------------------------------------------------------------
+
+class ApolloModern(nn.Module):
+    def __init__(self, cfg: ApolloModernConfig):
+        super().__init__()
+        self.cfg = cfg
+
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
+
+        # Learned positional embedding only if not using RoPE
+        if not cfg.use_rope:
+            self.pos_emb = nn.Embedding(cfg.block_size, cfg.n_embd)
+        else:
+            self.pos_emb = None
+
+        self.drop = nn.Dropout(cfg.dropout)
+        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
+        self.norm_f = make_norm(cfg.n_embd, cfg.norm_type)
+
+        # Output head, weight-tied to input embedding
+        self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        self.head.weight = self.tok_emb.weight  # weight tying
+
+        # RoPE cache (lazy-built on first forward, then cached on the right device)
+        self._rope_cache_device = None
+        self._rope_cache = None
+
+        self.apply(self._init_weights)
+        # Scale residual projection inits by 1/sqrt(2L) per GPT-2 recipe
+        for name, p in self.named_parameters():
+            if name.endswith('proj.weight') or name.endswith('w3.weight'):
+                # attention output proj and SwiGLU output proj
+                nn.init.normal_(p, mean=0.0, std=cfg.init_std / math.sqrt(2 * cfg.n_layer))
+            elif name.endswith('fc2.weight'):
+                # GELU FFN output proj
+                nn.init.normal_(p, mean=0.0, std=cfg.init_std / math.sqrt(2 * cfg.n_layer))
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.normal_(m.weight, mean=0.0, std=self.cfg.init_std)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, mean=0.0, std=self.cfg.init_std)
+
+    def _get_rope_cache(self, T: int, device):
+        if self.cfg.use_rope is False:
+            return None
+        head_dim = self.cfg.n_embd // self.cfg.n_head
+        if self._rope_cache_device != device or self._rope_cache is None:
+            cos, sin = build_rope_cache(self.cfg.block_size, head_dim, device)
+            self._rope_cache = (cos, sin)
+            self._rope_cache_device = device
+        cos, sin = self._rope_cache
+        return cos[:T], sin[:T]
+
+    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
+        B, T = idx.shape
+        assert T <= self.cfg.block_size
+
+        x = self.tok_emb(idx)
+        if self.pos_emb is not None:
+            pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+            x = x + self.pos_emb(pos)
+        x = self.drop(x)
+
+        rope_cache = self._get_rope_cache(T, idx.device) if self.cfg.use_rope else None
+
+        for block in self.blocks:
+            x = block(x, rope_cache=rope_cache)
+
+        x = self.norm_f(x)
+        logits = self.head(x)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+            )
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        for _ in range(max_new_tokens):
+            idx_cond = idx if idx.size(1) <= self.cfg.block_size else idx[:, -self.cfg.block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / max(temperature, 1e-8)
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('inf')
+            probs = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat([idx, next_id], dim=1)
+        return idx
+
+    def num_params(self, exclude_embeddings: bool = True) -> int:
+        n = sum(p.numel() for p in self.parameters())
+        if exclude_embeddings:
+            n -= self.tok_emb.weight.numel()
+            if self.pos_emb is not None:
+                n -= self.pos_emb.weight.numel()
+        return n
+
+
+# ----------------------------------------------------------------------
+# Ablation presets
+# ----------------------------------------------------------------------
+
+ABLATION_PRESETS = {
+    # A0: Apollo v2 baseline reproduction. Old arch.
+    'baseline': dict(
+        use_rope=False, norm_type='layernorm',
+        use_qk_norm=False, ffn_type='gelu',
+    ),
+    # Each preset toggles ONE component vs baseline.
+    'rope':     dict(use_rope=True,  norm_type='layernorm', use_qk_norm=False, ffn_type='gelu'),
+    'rmsnorm':  dict(use_rope=False, norm_type='rmsnorm',   use_qk_norm=False, ffn_type='gelu'),
+    'qknorm':   dict(use_rope=False, norm_type='layernorm', use_qk_norm=True,  ffn_type='gelu'),
+    'swiglu':   dict(use_rope=False, norm_type='layernorm', use_qk_norm=False, ffn_type='swiglu'),
+    # Full modern stack (all four arch components on; Muon optimizer toggle is in train.py)
+    'modern':   dict(use_rope=True,  norm_type='rmsnorm',   use_qk_norm=True,  ffn_type='swiglu'),
+}
+
+
+def build_model(preset: str, vocab_size: int = 32000, block_size: int = 256) -> ApolloModern:
+    if preset not in ABLATION_PRESETS:
+        raise ValueError(f"unknown preset {preset}; choose from {list(ABLATION_PRESETS.keys())}")
+    cfg = ApolloModernConfig(
+        vocab_size=vocab_size,
+        block_size=block_size,
+        **ABLATION_PRESETS[preset],
+    )
+    return ApolloModern(cfg)
+
+
+if __name__ == '__main__':
+    # Sanity check: build each preset and report param counts
+    for name in ABLATION_PRESETS:
+        m = build_model(name)
+        body = m.num_params(exclude_embeddings=True)
+        total = m.num_params(exclude_embeddings=False)
+        print(f"{name:10s}  body={body/1e6:6.2f}M  total={total/1e6:6.2f}M")
